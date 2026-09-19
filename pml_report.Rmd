@@ -1,0 +1,158 @@
+---
+title: "Predicting How Well Barbell Lifts Are Performed"
+author: "Maitreya Tarmale"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output: html_document
+---
+
+<style>
+body { font-size: 14px; line-height: 1.45; }
+table { width: auto !important; }
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+# Overview
+
+Wearable devices make it easy to measure *how much* of an activity people do, but rarely *how well* they do it. In this project I use accelerometer data from the belt, forearm, arm and dumbbell of 6 participants who lifted a barbell correctly and incorrectly in 5 ways. The goal is to predict the manner of the exercise, the `classe` variable (A = correct form, B to E = four common mistakes), from the sensor readings.
+
+I clean the data, hold out a validation set, fit a baseline decision tree and a random forest with 5-fold cross-validation, estimate the out-of-sample error on the held-out data, and use the final model to predict the 20 test cases.
+
+Data source: Velloso, E., Bulling, A., Gellersen, H., Ugulino, W., Fuks, H. *Qualitative Activity Recognition of Weight Lifting Exercises.* Proceedings of the 4th International Conference in Cooperation with SIGCHI (Augmented Human '13), Stuttgart, 2013.
+
+# Loading the data
+
+```{r load}
+library(caret)
+library(randomForest)
+library(rpart)
+
+train_file <- "pml-training.csv"
+test_file  <- "pml-testing.csv"
+train_url  <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+test_url   <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+# Download only if the files are not already in the working folder
+if (!file.exists(train_file)) download.file(train_url, train_file)
+if (!file.exists(test_file))  download.file(test_url,  test_file)
+
+na_codes <- c("NA", "", "#DIV/0!")
+raw      <- read.csv(train_file, na.strings = na_codes)
+test_raw <- read.csv(test_file,  na.strings = na_codes)
+dim(raw)
+```
+
+The training file has `r nrow(raw)` rows and `r ncol(raw)` columns, and the test file has `r nrow(test_raw)` rows (the 20 cases to predict).
+
+# Cleaning the data
+
+I made three cleaning choices:
+
+1. **Removed the first 7 columns** (row index, user name, timestamps and window markers). These identify *who* and *when*, not *how* the lift was done, and using them would let a model "cheat" on this dataset instead of learning movement patterns.
+2. **Removed columns that are mostly missing** (more than 90% `NA`). These are summary statistics that exist only for a few rows, and the 20 test cases have them empty anyway.
+3. **Removed near-zero-variance predictors**, which carry almost no information.
+
+```{r clean}
+raw      <- raw[, -(1:7)]
+test_raw <- test_raw[, -(1:7)]
+
+keep <- colMeans(is.na(raw)) < 0.9
+raw  <- raw[, keep]
+
+predictor_cols <- setdiff(names(raw), "classe")
+nzv <- nearZeroVar(raw[, predictor_cols])
+if (length(nzv) > 0) raw <- raw[, -nzv]
+
+raw$classe <- factor(raw$classe)
+predictor_cols <- setdiff(names(raw), "classe")
+test_x <- test_raw[, predictor_cols]
+
+length(predictor_cols)
+table(raw$classe)
+```
+
+After cleaning, `r length(predictor_cols)` predictors remain. The five classes are reasonably balanced, with class A the most common.
+
+# Model building and cross-validation
+
+**Validation split.** I set aside 30% of the training data as a validation set that the models never see during training. This gives an honest estimate of the out-of-sample error.
+
+**Cross-validation.** Inside the 70% training part, I used 5-fold cross-validation for both models (`trainControl(method = "cv", number = 5)`). The data are split into 5 parts, the model is trained on 4 and tested on the 5th, and this is repeated so each part is used once for testing. This also lets `train()` pick the best tuning value.
+
+**Why these models.** I started with a single decision tree (`rpart`) as an easy-to-interpret baseline. I then fit a random forest, which averages many trees. Random forests handle many correlated numeric predictors and non-linear patterns well, need little preprocessing (no scaling), and are known to work well on sensor data like this.
+
+```{r models}
+set.seed(12345)
+in_train   <- createDataPartition(raw$classe, p = 0.7, list = FALSE)
+training   <- raw[in_train, ]
+validation <- raw[-in_train, ]
+
+ctrl <- trainControl(method = "cv", number = 5)
+
+set.seed(12345)
+fit_tree <- train(classe ~ ., data = training, method = "rpart", trControl = ctrl)
+
+set.seed(12345)
+fit_rf <- train(classe ~ ., data = training, method = "rf", trControl = ctrl,
+                ntree = 100, tuneGrid = data.frame(mtry = c(2, 7, 27)))
+
+fit_rf
+```
+
+# Out-of-sample error
+
+The cross-validated accuracy comes from the 5 folds inside the training data. The validation accuracy comes from the 30% that was held out entirely. Because the validation set was never used for training or tuning, its error is my estimate of the **expected out-of-sample error**.
+
+```{r evaluate}
+cm_tree <- confusionMatrix(predict(fit_tree, validation), validation$classe)
+cm_rf   <- confusionMatrix(predict(fit_rf,   validation), validation$classe)
+
+results <- data.frame(
+  Model = c("Decision tree (rpart)", "Random forest"),
+  CV_accuracy         = c(max(fit_tree$results$Accuracy), max(fit_rf$results$Accuracy)),
+  Validation_accuracy = c(cm_tree$overall["Accuracy"], cm_rf$overall["Accuracy"])
+)
+results$Expected_out_of_sample_error <- 1 - results$Validation_accuracy
+knitr::kable(results, digits = 4)
+```
+
+```{r cm-plot, fig.height=4, fig.width=5, fig.cap="Figure 1: Random forest confusion matrix on the validation set (counts)."}
+library(ggplot2)
+cm_df <- as.data.frame(cm_rf$table)
+ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 3) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(x = "Actual class", y = "Predicted class") +
+  theme_minimal()
+```
+
+The random forest reaches a validation accuracy of **`r round(cm_rf$overall["Accuracy"], 4)`**, so the expected out-of-sample error is about **`r round(100 * (1 - cm_rf$overall["Accuracy"]), 2)`%**. The decision tree reaches only `r round(cm_tree$overall["Accuracy"], 4)`, so the random forest is clearly the better choice here. The cross-validated accuracy (`r round(max(fit_rf$results$Accuracy), 4)`) agrees closely with the validation accuracy, which suggests the model is not overfitting. Because the final model is fit on 70% of the data and the true error can vary between samples, I would expect the error on new data to be similar, and perhaps slightly higher, especially for new participants not seen in training.
+
+```{r importance, fig.height=4.5, fig.width=6, fig.cap="Figure 2: Top 15 most important predictors in the random forest."}
+imp <- varImp(fit_rf)
+plot(imp, top = 15)
+```
+
+The most important predictors are readings from the belt, dumbbell and forearm sensors, which makes physical sense since the different mistakes change how the torso, wrist and weight move.
+
+# Predictions for the 20 test cases
+
+I used the random forest to predict the 20 test cases.
+
+```{r predict}
+pred_test <- predict(fit_rf, test_x)
+data.frame(problem_id = test_raw$problem_id, prediction = pred_test)
+```
+
+The predictions in order (for the course prediction quiz) are:
+
+```{r predict-vector}
+as.character(pred_test)
+```
+
+# Conclusion
+
+Cleaning the data to remove identifiers and mostly-empty columns, then fitting a random forest with 5-fold cross-validation, gave a highly accurate model. A separate validation set estimates the out-of-sample error at about `r round(100 * (1 - cm_rf$overall["Accuracy"]), 2)`%, and the model was used to predict the 20 test cases.
